@@ -1,0 +1,689 @@
+package playwright_test
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/mxschmitt/playwright-go"
+	"github.com/stretchr/testify/require"
+)
+
+func TestBrowserTypeBrowserName(t *testing.T) {
+	BeforeEach(t)
+
+	require.Equal(t, pw.Chromium.Name(), "chromium")
+	require.Equal(t, pw.Firefox.Name(), "firefox")
+	require.Equal(t, pw.WebKit.Name(), "webkit")
+}
+
+func TestBrowserTypeExecutablePath(t *testing.T) {
+	BeforeEach(t)
+
+	require.Greater(t, len(pw.Chromium.ExecutablePath()), 0)
+}
+
+func TestBrowserTypeLaunchPersistentContext(t *testing.T) {
+	BeforeEach(t)
+
+	user_data_dir1 := t.TempDir()
+	browser_context, err := browserType.LaunchPersistentContext(user_data_dir1)
+	require.NoError(t, err)
+	page, err := browser_context.NewPage()
+	require.NoError(t, err)
+	_, err = page.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+	_, err = page.Evaluate("() => localStorage.hey = 'hello'")
+	require.NoError(t, err)
+	require.NoError(t, browser_context.Close())
+
+	browser_context2, err := browserType.LaunchPersistentContext(user_data_dir1)
+	require.NoError(t, err)
+	page2, err := browser_context2.NewPage()
+	require.NoError(t, err)
+	_, err = page2.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+	result, err := page2.Evaluate("() => localStorage.hey")
+	require.NoError(t, err)
+	require.Equal(t, "hello", result)
+	require.NoError(t, browser_context2.Close())
+
+	user_data_dir2 := t.TempDir()
+	browser_context3, err := browserType.LaunchPersistentContext(user_data_dir2)
+	require.NoError(t, err)
+	page3, err := browser_context3.NewPage()
+	require.NoError(t, err)
+	_, err = page3.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+	result, err = page3.Evaluate("() => localStorage.hey")
+	require.NoError(t, err)
+	require.NotEqual(t, "hello", result)
+	require.NoError(t, browser_context3.Close())
+}
+
+// TestLaunchPersistentContextAppliesSelectorEngines verifies that a custom
+// selector engine registered before LaunchPersistentContext is applied to the
+// persistent context (previously addContext was skipped for persistent contexts).
+func TestLaunchPersistentContextAppliesSelectorEngines(t *testing.T) {
+	BeforeEach(t)
+
+	tagSelector := `(() => ({
+		query(root, selector) { return root.querySelector(selector); },
+		queryAll(root, selector) { return Array.from(root.querySelectorAll(selector)); }
+	}))()`
+	engineName := fmt.Sprintf("ptag_%s_%d", browserName, time.Now().UnixNano())
+	require.NoError(t, pw.Selectors.Register(engineName, playwright.Script{Content: &tagSelector}))
+
+	ctx, err := browserType.LaunchPersistentContext(t.TempDir())
+	require.NoError(t, err)
+	defer ctx.Close() //nolint:errcheck
+	p, err := ctx.NewPage()
+	require.NoError(t, err)
+	require.NoError(t, p.SetContent(`<div><span></span></div>`))
+	name, err := p.Locator(engineName+"=DIV").Evaluate("e => e.nodeName", nil)
+	require.NoError(t, err)
+	require.Equal(t, "DIV", name)
+}
+
+func TestBrowserTypeConnect(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	defer remoteServer.Close()
+
+	browser1, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	browser_context, err := browser1.NewContext()
+	require.NoError(t, err)
+	page, err := browser_context.NewPage()
+	require.NoError(t, err)
+	result, err := page.Evaluate("11 * 11")
+	require.NoError(t, err)
+	require.Equal(t, result, 121)
+	require.NoError(t, browser1.Close())
+}
+
+func TestBrowserTypeConnectShouldBeAbleToReconnectToBrowser(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	defer remoteServer.Close()
+
+	browser1, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	require.Len(t, browser1.Contexts(), 0)
+	browser_context, err := browser1.NewContext()
+	require.NoError(t, err)
+	require.Len(t, browser1.Contexts(), 1)
+	require.Len(t, browser_context.Pages(), 0)
+	page, err := browser_context.NewPage()
+	require.Len(t, browser_context.Pages(), 1)
+	require.NoError(t, err)
+	result, err := page.Evaluate("11 * 11")
+	require.NoError(t, err)
+	require.Equal(t, result, 121)
+	require.NoError(t, browser1.Close())
+
+	browser1, err = browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	require.Len(t, browser1.Contexts(), 0)
+	browser_context, err = browser1.NewContext()
+	require.NoError(t, err)
+	require.Len(t, browser1.Contexts(), 1)
+	require.Len(t, browser_context.Pages(), 0)
+	page, err = browser_context.NewPage()
+	require.Len(t, browser_context.Pages(), 1)
+	require.NoError(t, err)
+	result, err = page.Evaluate("11 * 11")
+	require.NoError(t, err)
+	require.Equal(t, result, 121)
+	require.NoError(t, browser1.Close())
+}
+
+func TestBrowserTypeConnectShouldEmitDisconnectedEvent(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	disconnected1 := newSyncSlice[bool]()
+	disconnected2 := newSyncSlice[bool]()
+	browser1, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	browser2, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser2)
+	browser1.OnDisconnected(func(playwright.Browser) {
+		disconnected1.Append(true)
+	})
+	browser2.OnDisconnected(func(playwright.Browser) {
+		disconnected2.Append(true)
+	})
+	page, err := browser2.NewPage()
+	require.NoError(t, err)
+	require.NoError(t, browser1.Close())
+	require.False(t, browser1.IsConnected())
+	require.Len(t, disconnected1.Get(), 1)
+	require.Len(t, disconnected2.Get(), 0)
+	remoteServer.Close()
+
+	_, err = page.Title()
+	require.Error(t, err)
+	require.False(t, browser2.IsConnected())
+	require.Len(t, disconnected2.Get(), 1)
+}
+
+func TestBrowserTypeConnectTimeoutIncludesInitializationAndClosesTransport(t *testing.T) {
+	BeforeEach(t)
+
+	connected := server.WaitForWebSocketConnection()
+	closed := make(chan struct{}, 1)
+	server.OnceWebSocketClose(func(_ *websocket.CloseError) {
+		closed <- struct{}{}
+	})
+
+	result := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := browserType.Connect(
+			strings.Replace(server.PREFIX, "http://", "ws://", 1)+"/ws",
+			playwright.BrowserTypeConnectOptions{Timeout: playwright.Float(500)},
+		)
+		result <- err
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		server.CloseClientConnections()
+		t.Fatal("WebSocket endpoint was not reached")
+	}
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, playwright.ErrTimeout)
+		require.ErrorContains(t, err, "Timeout 500ms exceeded.")
+		require.Less(t, time.Since(started), 2*time.Second)
+	case <-time.After(5 * time.Second):
+		server.CloseClientConnections()
+		t.Fatal("BrowserType.Connect did not time out while Root.initialize was pending")
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BrowserType.Connect did not close the WebSocket after timing out")
+	}
+}
+
+func TestBrowserTypeConnectInitializationErrorClosesTransport(t *testing.T) {
+	BeforeEach(t)
+
+	protocolErrors := make(chan error, 1)
+	server.OnceWebSocketMessage(func(connection *websocket.Conn, request *http.Request, _ websocket.MessageType, payload []byte) {
+		var initialize struct {
+			ID int `json:"id"`
+		}
+		if err := json.Unmarshal(payload, &initialize); err != nil {
+			protocolErrors <- err
+			_ = connection.CloseNow()
+			return
+		}
+		response, err := json.Marshal(map[string]any{
+			"id": initialize.ID,
+			"error": map[string]any{
+				"error": map[string]any{
+					"name":    "Error",
+					"message": "initialize failed",
+					"stack":   "",
+				},
+			},
+		})
+		if err == nil {
+			err = connection.Write(request.Context(), websocket.MessageText, response)
+		}
+		if err != nil {
+			protocolErrors <- err
+			_ = connection.CloseNow()
+		}
+	})
+
+	closed := make(chan struct{}, 1)
+	server.OnceWebSocketClose(func(_ *websocket.CloseError) {
+		closed <- struct{}{}
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := browserType.Connect(strings.Replace(server.PREFIX, "http://", "ws://", 1) + "/ws")
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		require.ErrorContains(t, err, "initialize failed")
+	case err := <-protocolErrors:
+		t.Fatalf("could not serve the initialization error: %v", err)
+	case <-time.After(5 * time.Second):
+		server.CloseClientConnections()
+		t.Fatal("BrowserType.Connect did not return the initialization error")
+	}
+
+	select {
+	case err := <-protocolErrors:
+		t.Fatalf("could not serve the initialization error: %v", err)
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BrowserType.Connect did not close the endpoint after initialization failed")
+	}
+}
+
+func TestBrowserTypeConnectMalformedEndpointClosesTransport(t *testing.T) {
+	BeforeEach(t)
+
+	protocolErrors := make(chan error, 1)
+	server.OnceWebSocketMessage(func(connection *websocket.Conn, request *http.Request, _ websocket.MessageType, payload []byte) {
+		var initialize struct {
+			ID int `json:"id"`
+		}
+		if err := json.Unmarshal(payload, &initialize); err != nil {
+			protocolErrors <- err
+			_ = connection.CloseNow()
+			return
+		}
+
+		messages := []map[string]any{
+			{
+				"guid":   "",
+				"method": "__create__",
+				"params": map[string]any{
+					"type":        "BrowserType",
+					"guid":        "chromium",
+					"initializer": map[string]any{"name": "chromium", "executablePath": ""},
+				},
+			},
+			{
+				"guid":   "",
+				"method": "__create__",
+				"params": map[string]any{
+					"type":        "BrowserType",
+					"guid":        "firefox",
+					"initializer": map[string]any{"name": "firefox", "executablePath": ""},
+				},
+			},
+			{
+				"guid":   "",
+				"method": "__create__",
+				"params": map[string]any{
+					"type":        "BrowserType",
+					"guid":        "webkit",
+					"initializer": map[string]any{"name": "webkit", "executablePath": ""},
+				},
+			},
+			{
+				"guid":   "",
+				"method": "__create__",
+				"params": map[string]any{
+					"type": "Playwright",
+					"guid": "playwright",
+					"initializer": map[string]any{
+						"chromium": map[string]any{"guid": "chromium"},
+						"firefox":  map[string]any{"guid": "firefox"},
+						"webkit":   map[string]any{"guid": "webkit"},
+					},
+				},
+			},
+			{
+				"id": initialize.ID,
+				"result": map[string]any{
+					"playwright": map[string]any{"guid": "playwright"},
+				},
+			},
+		}
+		for _, message := range messages {
+			data, err := json.Marshal(message)
+			if err == nil {
+				err = connection.Write(request.Context(), websocket.MessageText, data)
+			}
+			if err != nil {
+				protocolErrors <- err
+				_ = connection.CloseNow()
+				return
+			}
+		}
+	})
+
+	closed := make(chan struct{}, 1)
+	server.OnceWebSocketClose(func(_ *websocket.CloseError) {
+		closed <- struct{}{}
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := browserType.Connect(strings.Replace(server.PREFIX, "http://", "ws://", 1) + "/ws")
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		require.ErrorContains(t, err, "malformed endpoint")
+	case err := <-protocolErrors:
+		t.Fatalf("could not serve the minimal Playwright protocol: %v", err)
+	case <-time.After(5 * time.Second):
+		server.CloseClientConnections()
+		t.Fatal("BrowserType.Connect did not reject the malformed endpoint")
+	}
+
+	select {
+	case err := <-protocolErrors:
+		t.Fatalf("could not serve the minimal Playwright protocol: %v", err)
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BrowserType.Connect did not close the malformed endpoint")
+	}
+}
+
+func TestBrowserTypeConnectSlowMo(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	defer remoteServer.Close()
+
+	browser1, err := browserType.Connect(remoteServer.url, playwright.BrowserTypeConnectOptions{
+		SlowMo:  playwright.Float(100),
+		Timeout: playwright.Float(0),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	browser_context, err := browser1.NewContext()
+	require.NoError(t, err)
+	t1 := time.Now()
+	page, err := browser_context.NewPage()
+	require.NoError(t, err)
+	result, err := page.Evaluate("11 * 11")
+	require.NoError(t, err)
+	require.Equal(t, result, 121)
+	require.GreaterOrEqual(t, time.Since(t1), time.Duration(time.Millisecond*200))
+	require.NoError(t, browser1.Close())
+}
+
+func TestBrowserTypeConnectArtifactPath(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	defer remoteServer.Close()
+
+	browser1, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	recordVideoDir := t.TempDir()
+	browserContext, err := browser1.NewContext(playwright.BrowserNewContextOptions{
+		RecordVideo: &playwright.RecordVideo{
+			Dir: playwright.String(recordVideoDir),
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, browserContext)
+	defer browserContext.Close() //nolint:errcheck
+	page, err := browserContext.NewPage()
+	require.NoError(t, err)
+	defer page.Close() //nolint:errcheck
+	_, err = page.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+	_, err = page.Video().Path()
+	require.Error(t, err)
+	require.Equal(t, err, errors.New("Path is not available when connecting remotely. Use SaveAs() to save a local copy."))
+}
+
+func TestBrowserTypeConnectOverCDP(t *testing.T) {
+	if !isChromium {
+		t.Skip("CDP is only supported on Chromium")
+	}
+	BeforeEach(t)
+
+	port, err := getFreePort()
+	require.NoError(t, err)
+	browserServer, err := browserType.Launch(playwright.BrowserTypeLaunchOptions{
+		Args: []string{fmt.Sprintf("--remote-debugging-port=%d", port)},
+	})
+	require.NoError(t, err)
+	defer browserServer.Close() //nolint:errcheck
+	// Register a custom selector engine before connecting; it must reach the
+	// CDP default context (it was previously never registered there).
+	tagSelector := `(() => ({
+		query(root, selector) { return root.querySelector(selector); },
+		queryAll(root, selector) { return Array.from(root.querySelectorAll(selector)); }
+	}))()`
+	engineName := fmt.Sprintf("cdptag_%d", time.Now().UnixNano())
+	require.NoError(t, pw.Selectors.Register(engineName, playwright.Script{Content: &tagSelector}))
+
+	browser, err := browserType.ConnectOverCDP(fmt.Sprintf("http://localhost:%d", port))
+	require.NoError(t, err)
+	require.NotNil(t, browser)
+	defer browser.Close() //nolint:errcheck
+	require.Len(t, browser.Contexts(), 1)
+
+	ctx := browser.Contexts()[0]
+	p, err := ctx.NewPage()
+	require.NoError(t, err)
+	require.NoError(t, p.SetContent(`<div><span></span></div>`))
+	name, err := p.Locator(engineName+"=DIV").Evaluate("e => e.nodeName", nil)
+	require.NoError(t, err)
+	require.Equal(t, "DIV", name)
+}
+
+func TestBrowserTypeConnectOverCDPTwice(t *testing.T) {
+	if !isChromium {
+		t.Skip("CDP is only supported on Chromium")
+	}
+	BeforeEach(t)
+
+	port, err := getFreePort()
+	require.NoError(t, err)
+	browserServer, err := browserType.Launch(playwright.BrowserTypeLaunchOptions{
+		Args: []string{fmt.Sprintf("--remote-debugging-port=%d", port)},
+	})
+	require.NoError(t, err)
+	defer browserServer.Close() //nolint:errcheck
+	browser1, err := browserType.ConnectOverCDP(fmt.Sprintf("http://localhost:%d", port))
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	browser2, err := browserType.ConnectOverCDP(fmt.Sprintf("http://localhost:%d", port))
+	require.NoError(t, err)
+	require.NotNil(t, browser2)
+	defer browser1.Close() //nolint:errcheck
+	defer browser2.Close() //nolint:errcheck
+	require.Len(t, browser1.Contexts(), 1)
+	page1, err := browser1.Contexts()[0].NewPage()
+	require.NoError(t, err)
+	_, err = page1.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+	require.Len(t, browser2.Contexts(), 1)
+	page2, err := browser2.Contexts()[0].NewPage()
+	require.NoError(t, err)
+	_, err = page2.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+
+	require.Len(t, browser1.Contexts()[0].Pages(), 2)
+	require.Len(t, browser2.Contexts()[0].Pages(), 2)
+}
+
+func TestSetInputFilesShouldPreserveLastModifiedTimestamp(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	defer remoteServer.Close()
+
+	browser1, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	browser_context, err := browser1.NewContext()
+	require.NoError(t, err)
+	page, err := browser_context.NewPage()
+	require.NoError(t, err)
+	require.NoError(t, page.SetContent(`<input type=file multiple=true/>`))
+	input := page.Locator("input")
+	filenames := []string{
+		"file-to-upload.txt",
+		"file-to-upload-2.txt",
+	}
+	files := make([]string, len(filenames))
+	for i, filename := range filenames {
+		files[i] = Asset(filename)
+	}
+	require.NoError(t, input.SetInputFiles(files))
+	result, err := input.Evaluate(`input => [...input.files].map(f => f.name)`, nil)
+	require.NoError(t, err)
+	names, ok := result.([]interface{})
+	require.True(t, ok)
+	for i, name := range names {
+		require.Equal(t, filenames[i], name.(string))
+	}
+
+	results, err := input.Evaluate(`input => [...input.files].map(f => f.lastModified)`, nil)
+	require.NoError(t, err)
+	timestamps, ok := results.([]interface{})
+	require.True(t, ok)
+	for i, timestamp := range timestamps {
+		expected, err := getFileLastModifiedTimeMs(files[i])
+		require.NoError(t, err)
+		// On Linux browser sometimes reduces the timestamp by 1ms: 1696272058110.0715  -> 1696272058109 or even
+		// rounds it to seconds in WebKit: 1696272058110 -> 1696272058000.
+		require.Less(t, math.Abs(float64(expected-int64(timestamp.(int)))), 1000.0)
+	}
+}
+
+// TestShouldUploadAFolderRemote occasionally wedges on the browser side under
+// WebKit on GitHub's hosted macOS runners: SetInputFiles never returns. Upstream
+// sees the same and marks the equivalent test test.slow() while leaning on its
+// `retries: 3`. Observed durations here are bimodal — ~1s when it works, "never"
+// when it wedges — so inflating the action timeout only makes a wedged run more
+// expensive, it does not buy success. Deliberately keep the default 30s action
+// timeout and no in-test retry loop: gotestsum's --rerun-fails in
+// .github/workflows/build.yml supplies the retries, in a fresh process with its
+// own -timeout budget, and reports the flake to flakiness.io.
+func TestShouldUploadAFolderRemote(t *testing.T) {
+	BeforeEach(t)
+
+	remoteServer, err := newRemoteServer()
+	require.NoError(t, err)
+	defer remoteServer.Close()
+
+	browser1, err := browserType.Connect(remoteServer.url)
+	require.NoError(t, err)
+	require.NotNil(t, browser1)
+	defer browser1.Close() //nolint:errcheck
+
+	browser_context, err := browser1.NewContext()
+	require.NoError(t, err)
+	page, err := browser_context.NewPage()
+	require.NoError(t, err)
+
+	_, err = page.Goto(fmt.Sprintf("%s%s", server.PREFIX, "/input/folderupload.html"))
+	require.NoError(t, err)
+
+	//nolint:staticcheck
+	input, err := page.QuerySelector("input")
+	require.NoError(t, err)
+
+	dir := filepath.Join(t.TempDir(), "file-upload-test")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file1.txt"), []byte("file1 content"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file2"), []byte("file2 content"), 0o600))
+	require.Nil(t, os.Mkdir(filepath.Join(dir, "sub-dir"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sub-dir", "really.txt"), []byte("sub-dir file content"), 0o600))
+	//nolint:staticcheck
+	require.NoError(t, input.SetInputFiles(dir))
+
+	ret, err := input.Evaluate(`e => [...e.files].map(f => f.webkitRelativePath)`)
+	require.NoError(t, err)
+
+	expectResult := []interface{}{"file-upload-test/file1.txt", "file-upload-test/file2"}
+	// https://issues.chromium.org/issues/345393164
+	if !isChromium || !headless || !chromiumVersionLessThan(browser.Version(), "127.0.6533.0") {
+		expectResult = append(expectResult, "file-upload-test/sub-dir/really.txt")
+	}
+	slices.SortFunc(ret.([]interface{}), func(i, j interface{}) int {
+		return strings.Compare(i.(string), j.(string))
+	})
+	require.Equal(t, expectResult, ret.([]interface{}))
+
+	webkitRelativePaths, err := input.Evaluate(`e => [...e.files].map(f => f.webkitRelativePath)`)
+	require.NoError(t, err)
+	for i, path := range webkitRelativePaths.([]interface{}) {
+		content, err := input.Evaluate(`(e, i) => {
+			const reader = new FileReader();
+			const promise = new Promise(fulfill => reader.onload = fulfill);
+			reader.readAsText(e.files[i]);
+			return promise.then(() => reader.result);
+    }`, i)
+		require.NoError(t, err)
+		b, err := os.ReadFile(filepath.Join(dir, "..", path.(string)))
+		require.NoError(t, err)
+		require.Equal(t, string(b), content.(string))
+	}
+}
+
+func TestBrowserBind(t *testing.T) {
+	BeforeEach(t)
+
+	result, err := browser.Bind("test-server")
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Endpoint)
+
+	// Connect from another Playwright instance
+	pw2, err := playwright.Run()
+	require.NoError(t, err)
+	defer func() { _ = pw2.Stop() }()
+
+	browser2, err := pw2.Chromium.Connect(result.Endpoint)
+	require.NoError(t, err)
+	require.NotNil(t, browser2)
+
+	page2, err := browser2.NewPage()
+	require.NoError(t, err)
+	_, err = page2.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+	require.Equal(t, server.EMPTY_PAGE, page2.URL())
+
+	require.NoError(t, browser2.Close())
+	require.NoError(t, browser.Unbind())
+}
+
+func TestBrowserTypeLaunchExplicitZeroTimeout(t *testing.T) {
+	BeforeEach(t)
+
+	launched, err := browserType.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+		Timeout:  playwright.Float(0),
+	})
+	require.NoError(t, err)
+	require.NoError(t, launched.Close())
+}
