@@ -88,10 +88,10 @@ func TestBrowserContextCloseRace(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start navigation in background
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		_, err := testPage.Goto("https://example.com/")
-		done <- err
+		defer close(done)
+		_, _ = testPage.Goto("https://example.com/")
 	}()
 
 	// Give route handlers time to start processing
@@ -127,10 +127,10 @@ func TestPageCloseRace(t *testing.T) {
 	}))
 
 	// Start navigation in background so route handlers run concurrently with Close().
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		_, err := page.Goto(server.EMPTY_PAGE)
-		done <- err
+		defer close(done)
+		_, _ = page.Goto(server.EMPTY_PAGE)
 	}()
 
 	// Give the route handler time to start processing.
